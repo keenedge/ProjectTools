@@ -37,13 +37,16 @@ param([string]$Ref = 'main')
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Add the import to the profile, replacing any older ProjectTools import line.
+    # Add the import to the profile, replacing any older ProjectTools import line
+    # (by name or by path to a .psd1/.psm1).
     $profilePath = $PROFILE.CurrentUserAllHosts
     $importLine = "Import-Module $ModuleName -DisableNameChecking"
     if (-not (Test-Path $profilePath)) { New-Item -ItemType File -Path $profilePath -Force | Out-Null }
     $lines = @(Get-Content $profilePath)
-    if ($lines -notcontains $importLine) {
-        $lines = @($lines | Where-Object { $_ -notmatch "^\s*Import-Module\s+$ModuleName\b" }) + $importLine
+    $oldImport = "^\s*Import-Module\s+(\S*[\\/])?$ModuleName(\.ps[dm]1)?(\s|$)"
+    $others = @($lines | Where-Object { $_ -notmatch $oldImport })
+    if ($lines.Count -ne $others.Count + 1 -or $lines -notcontains $importLine) {
+        $lines = $others + $importLine
         Set-Content -Path $profilePath -Value $lines
         Write-Step "Added '$importLine' to $profilePath"
     }
