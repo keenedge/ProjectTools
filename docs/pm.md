@@ -97,7 +97,7 @@ To install from another branch, tag or commit, use the scriptblock form so you c
 ### Syntax
 
 ```text
-pm clone [<repo>]   [-Root <path>] [-Owner <owner>] [--all]
+pm clone [<repo>]   [-Root <path>] [-Owner <owner>] [-Folder <folder>] [--all]
 pm init  [<name>]   [-Root <path>]                  [--all]
 pm save  [<project>] [-Root <path>] [-Message <msg>] [-NoPush] [--all]
 ```
@@ -108,7 +108,7 @@ pm save  [<project>] [-Root <path>] [-Message <msg>] [-NoPush] [--all]
 
 ### pm clone
 
-Clone a GitHub repo into `<root>\<repo name>` and set up its backup.
+Clone a GitHub repo into `<root>\<folder>` and set up its backup. The folder is the repo name unless a folder mapping says otherwise (see below).
 
 - **No name:** lists your repos (or `-Owner`'s), newest first.
   - Each line shows public/private, the description, and `*` if the repo is already cloned in the root.
@@ -119,9 +119,27 @@ Clone a GitHub repo into `<root>\<repo name>` and set up its backup.
 - If a repo is already cloned, the clone is skipped. Backup setup still runs if `.backup.json` is missing.
 - If the target folder exists, is not a git repo, and is not empty, the command fails.
 
+**Folder names.** `-Folder <folder>` clones into `<root>\<folder>` instead of the repo name. It also saves the choice in `~\.config\pm\config.json`:
+
+```json
+{
+  "folders": {
+    "keenedge/homelab": "_homelab"
+  }
+}
+```
+
+- Mappings are keyed by `owner/repo`, matched in any case.
+- Later `pm clone` runs, including `--all`, use the mapped folder automatically. The `*` marker in the pick list also checks it.
+- Running `-Folder` again for the same repo replaces its mapping. You can also edit the file by hand. A missing or empty file means no mappings.
+- `-Folder` is for one repo, so it can't be combined with `--all`.
+- An existing folder is never overwritten. The same skip and fail rules as above apply.
+- The restic tag stays the **repo name**, whatever the folder is called, so snapshots stay grouped by repo.
+
 ```powershell
 pm clone                  # pick from a list
 pm clone flario           # by name
+pm clone homelab -Folder _homelab   # clone into _homelab and remember it
 pm clone someorg/tool -Owner someorg
 pm clone --all -Root D:\src
 ```
@@ -182,6 +200,7 @@ restic restore latest --tag my-tool --target D:\restore\my-tool
 | `<project>\.backup.json` | clone, init | No (`.git/info/exclude`) | restic repository and tag for this project. |
 | `<project>\.restic\include.restic.txt` | clone, init | Yes | Paths to back up. Empty = whole project. |
 | `<project>\.restic\exclude.restic.txt` | clone, init | Yes | Exclude patterns. Default `.restic`, `.git`. |
+| `~\.config\pm\config.json` | clone `-Folder` | — | Folder mappings: `owner/repo` → folder name. |
 | `~\Documents\PowerShell\Modules\ProjectTools\` | Install.ps1 | — | Installed module. |
 | `$PROFILE.CurrentUserAllHosts` | Install.ps1 | — | Gets `Import-Module ProjectTools -DisableNameChecking`. |
 

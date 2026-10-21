@@ -9,8 +9,42 @@ $ConfigName = '.backup.json'
 $ResticDir = '.restic'
 $IncludeName = 'include.restic.txt'
 $ExcludeName = 'exclude.restic.txt'
+# User settings. "folders" maps owner/repo to the folder pm clone uses instead of the repo name.
+$PmConfigFile = Join-Path $HOME '.config\pm\config.json'
 
 function Write-Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
+
+# Read the user config. A missing or empty file gives an empty config.
+function Get-PmConfig {
+    $config = $null
+    if (Test-Path $PmConfigFile) {
+        $text = Get-Content $PmConfigFile -Raw
+        if ($text -and $text.Trim()) { $config = $text | ConvertFrom-Json -AsHashtable }
+    }
+    if (-not $config) { $config = [ordered]@{} }
+    if (-not $config['folders']) { $config['folders'] = [ordered]@{} }
+    $config
+}
+
+# Folder for a repo: the configured mapping (owner/repo, any case), else the repo name.
+function Get-RepoFolder([hashtable]$Folders, [object]$Repo) {
+    foreach ($key in $Folders.Keys) {
+        if ($key -eq $Repo.nameWithOwner) { return $Folders[$key] }
+    }
+    $Repo.name
+}
+
+function Set-RepoFolder([object]$Repo, [string]$Folder) {
+    $config = Get-PmConfig
+    $folders = $config['folders']
+    foreach ($key in @($folders.Keys)) {
+        if ($key -eq $Repo.nameWithOwner) { $folders.Remove($key) }
+    }
+    $folders[$Repo.nameWithOwner] = $Folder
+    New-Item -ItemType Directory -Path (Split-Path $PmConfigFile) -Force | Out-Null
+    $config | ConvertTo-Json -Depth 5 | Set-Content -Path $PmConfigFile -Encoding utf8
+    Write-Host "Saved folder mapping $($Repo.nameWithOwner) -> $Folder in $PmConfigFile"
+}
 
 function Assert-Command([string[]]$Names) {
     foreach ($n in $Names) {
@@ -77,7 +111,7 @@ function Select-Repo([object[]]$Repos, [string]$Root) {
     for ($i = 0; $i -lt $Repos.Count; $i++) {
         $r = $Repos[$i]
         $vis = if ($r.isPrivate) { 'private' } else { 'public ' }
-        $here = if (Test-Path (Join-Path $Root "$($r.name)\.git")) { '*' } else { ' ' }
+        $here = if (Test-Path (Join-Path $Root "$($r.folder)\.git")) { '*' } else { ' ' }
         $desc = if ($r.description) { " - $($r.description)" } else { '' }
         Write-Host ('{0,3}) {1} {2}  {3}{4}' -f ($i + 1), $here, $vis, $r.nameWithOwner, $desc)
     }
@@ -145,7 +179,7 @@ function Get-GitHubRepos([string]$Owner) {
 }
 
 function Copy-Repo([string]$Root, [object]$Repo) {
-    $dest = Join-Path $Root $Repo.name
+    $dest = Join-Path $Root $Repo.folder
     if (Test-Path (Join-Path $dest '.git')) {
         Write-Host "Already cloned at $dest - skipping clone."
     } elseif ((Test-Path $dest) -and (Get-ChildItem $dest -Force | Select-Object -First 1)) {
@@ -155,15 +189,19 @@ function Copy-Repo([string]$Root, [object]$Repo) {
         gh repo clone $Repo.nameWithOwner $dest
         if ($LASTEXITCODE -ne 0) { throw 'Clone failed.' }
     }
+    # The restic tag is always the repo name, whatever the folder is called.
     if (-not (Test-Path (Join-Path $dest $ConfigName))) { Set-ProjectBackup $dest $Repo.name }
 }
 
-function Invoke-Clone([string]$Root, [string]$Name, [string]$Owner, [switch]$All) {
+function Invoke-Clone([string]$Root, [string]$Name, [string]$Folder, [string]$Owner, [switch]$All) {
+    if ($Folder -and $Folder.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { throw "Invalid folder name: $Folder" }
     Assert-BackupEnvironment gh, git, restic
     $repos = Get-GitHubRepos $Owner
+    $folders = (Get-PmConfig)['folders']
+    foreach ($r in $repos) { $r | Add-Member -NotePropertyName folder -NotePropertyValue (Get-RepoFolder $folders $r) }
 
     if ($All) {
-        $missing = @($repos | Where-Object { -not (Test-Path (Join-Path $Root "$($_.name)\.git")) })
+        $missing = @($repos | Where-Object { -not (Test-Path (Join-Path $Root "$($_.folder)\.git")) })
         Write-Host "$($repos.Count) repos, $($missing.Count) not yet in $Root."
         if (-not (Confirm-Action "Clone all into $Root and set up backups?")) { Write-Host 'Cancelled.'; return }
         Invoke-ForEach $repos { param($r) $r.nameWithOwner } { param($r) Copy-Repo $Root $r }
@@ -177,6 +215,10 @@ function Invoke-Clone([string]$Root, [string]$Name, [string]$Owner, [switch]$All
         Write-Host "(* = already in $Root)"
         $repo = Select-Repo $repos $Root
         if (-not $repo) { Write-Host 'Cancelled.'; return }
+    }
+    if ($Folder) {
+        Set-RepoFolder $repo $Folder
+        $repo.folder = $Folder
     }
     Copy-Repo $Root $repo
 }
@@ -301,6 +343,7 @@ function Manage-Project {
         pm clone [repo] | pm init [name] | pm save [project]  -- each takes --all.
     .DESCRIPTION
         clone  Clone a GitHub repo (asks with a list if no name) and set up backups.
+               -Folder clones into that folder instead of the repo name and remembers it.
                --all clones every repo you own.
         init   Create a project folder, or adopt an existing one, and set up backups.
                Asks for a name if none is given. --all sets up every folder not yet set up.
@@ -309,6 +352,8 @@ function Manage-Project {
         With --all any name is ignored. Everything works under -Root, default the current folder.
     .EXAMPLE
         pm clone flario
+    .EXAMPLE
+        pm clone homelab -Folder _homelab
     .EXAMPLE
         pm init my-tool
     .EXAMPLE
@@ -327,6 +372,7 @@ function Manage-Project {
 
         [string]$Root = (Get-Location).Path,
         [string]$Owner,
+        [string]$Folder,
         [string]$Message,
         [switch]$All,
         [switch]$NoPush,
@@ -338,20 +384,21 @@ function Manage-Project {
     $ErrorActionPreference = 'Stop'
 
     if ('--all' -in (@($Name) + @($Rest))) { $All = $true }
+    if ($All -and $Folder) { throw '-Folder names a single repo; it cannot be used with --all.' }
     if ($All) { $Name = $null }
     elseif ($Rest) { throw "Unexpected argument: $($Rest -join ' ')" }
 
     $bad = switch ($Action) {
         'clone' { 'Message', 'NoPush' }
-        'init'  { 'Owner', 'Message', 'NoPush' }
-        'save'  { 'Owner' }
+        'init'  { 'Owner', 'Folder', 'Message', 'NoPush' }
+        'save'  { 'Owner', 'Folder' }
     }
     foreach ($key in $bad) {
         if ($PSBoundParameters.ContainsKey($key)) { throw "-$key is not valid with '$Action'." }
     }
 
     switch ($Action) {
-        'clone' { Invoke-Clone $Root $Name $Owner -All:$All }
+        'clone' { Invoke-Clone $Root $Name $Folder $Owner -All:$All }
         'init'  { Invoke-Init $Root $Name -All:$All }
         'save'  { Invoke-Save $Root $Name $Message -NoPush:$NoPush -All:$All }
     }

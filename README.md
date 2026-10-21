@@ -21,6 +21,7 @@ Run these from the folder that holds your projects, or pass `-Root <path>`.
 ```powershell
 pm clone                     # pick a GitHub repo from a list, clone it, set up backup
 pm clone flario              # clone a repo by name
+pm clone homelab -Folder _homelab  # clone into a custom folder (remembered in ~\.config\pm\config.json)
 pm init my-tool              # new local project (git init + backup config)
 pm save -Message "fix stuff" # commit, push, restic backup of the current project
 pm save --all -NoPush        # commit + back up every project, no push
