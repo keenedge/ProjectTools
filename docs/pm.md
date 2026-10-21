@@ -1,14 +1,15 @@
 # pm — ProjectTools reference
 
-`pm` (alias of `Manage-Project`) manages a folder of project directories. Each project is a git repository with its own restic backup settings. It does three things:
+`pm` (alias of `Manage-Project`) manages a folder of project directories. Each project is a git repository with its own restic backup settings. It has four commands:
 
-| Command    | What it does |
-|------------|--------------|
-| `pm clone` | Clone a GitHub repo and set up its backup. |
-| `pm init`  | Create a new local project, or adopt an existing folder, and set up its backup. |
-| `pm save`  | Commit and push, then back up the working folder with restic. |
+| Command      | What it does |
+|--------------|--------------|
+| `pm clone`   | Clone a GitHub repo and set up its backup. |
+| `pm init`    | Create a new local project, or adopt an existing folder, and set up its backup. |
+| `pm save`    | Commit and push, then back up the working folder with restic. |
+| `pm restore` | Restore a project from its restic snapshots. |
 
-Each command also accepts `--all`, which runs it across every project folder under the root.
+`clone`, `init` and `save` also accept `--all`, which runs the command across every project folder under the root.
 
 - [Concepts](#concepts)
 - [Prerequisites](#prerequisites)
@@ -100,6 +101,7 @@ To install from another branch, tag or commit, use the scriptblock form so you c
 pm clone [<repo>]   [-Root <path>] [-Owner <owner>] [-Folder <folder>] [--all]
 pm init  [<name>]   [-Root <path>]                  [--all]
 pm save  [<project>] [-Root <path>] [-Message <msg>] [-NoPush] [--all]
+pm restore [<project>] [-Root <path>] [-Snapshot <id>] [-Target <path>] [-Force] [-DryRun]
 ```
 
 - `--all` and `-All` are equivalent. With `--all`, any name you pass is ignored.
@@ -184,14 +186,51 @@ pm save my-tool -NoPush
 pm save --all -NoPush -Root D:\src
 ```
 
-### Checking backups
+### pm restore
 
-`pm` has no restore or list command. Use restic directly:
+Restore a project's files from restic.
+
+**Choosing what to restore**
+
+- **No project given:** lists every snapshot tag in `RESTIC_REPOSITORY`, newest first. Each line shows the latest snapshot time, the number of snapshots, and the original folder. Pick it the same way as in `pm clone`: a number, a text filter, or blank to cancel.
+- **With a project:** uses the latest snapshot with that tag.
+- **`-Snapshot <id>`:** uses that snapshot instead. A short ID prefix is enough. Without a project name, the snapshot's own tag is used.
+
+**Where it restores**
+
+- **Default target:** `<root>\<folder>`.
+  - The folder comes from the `config.json` mapping whose repo name matches the tag, e.g. `keenedge/homelab` → `_homelab` for tag `homelab`. Otherwise it's the tag itself.
+  - `-Target <path>` overrides it.
+- **How:** the snapshot's original folder (e.g. `D:\projects\x`) is restored with `<snapshot>:/D/projects/x`, so files land directly in the target rather than under `D\projects\x\...`.
+- **Repository:** if the target already has a `.backup.json`, its `repository` is used; otherwise `RESTIC_REPOSITORY`.
+
+**Safety**
+
+- If the target exists and isn't empty, `pm` asks first. `-Force` skips the question.
+- Files in the snapshot overwrite files with the same name. Files that aren't in the snapshot are never deleted.
+- `-DryRun` shows what would be restored (`restic restore --dry-run -v`) and writes nothing.
+
+**What you get back**
+
+- `.git` and `.restic` are excluded from backups by default, so the restored folder has no git history.
+- If `.backup.json` came back, `pm` recreates the default `.restic` files.
+- To reattach git history, run this in the folder:
+
+  ```powershell
+  git init; git remote add origin <url>; git fetch; git reset origin/<branch>
+  ```
+
+  `git reset` without `--hard` keeps the restored files.
+- For a project backed up with an include list, the snapshot holds several paths, and their common parent folder is restored.
 
 ```powershell
-restic snapshots --tag my-tool
-restic restore latest --tag my-tool --target D:\restore\my-tool
+pm restore                                 # pick a project from the snapshot tags
+pm restore holdclick -DryRun               # preview
+pm restore holdclick -Target D:\restore\holdclick
+pm restore holdclick -Snapshot b12f6fd9 -Force
 ```
+
+To browse snapshots directly: `restic snapshots --tag <project>`.
 
 ## Files
 

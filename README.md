@@ -1,6 +1,6 @@
 # ProjectTools (`pm`)
 
-A PowerShell 7 module for managing a folder of git projects. It clones GitHub repos, sets up new local projects, and commits, pushes and backs each one up with restic (to OneDrive via rclone).
+A PowerShell 7 module for managing a folder of git projects. It clones GitHub repos, sets up new local projects, commits, pushes and backs each one up with restic (to OneDrive via rclone), and restores from those backups.
 
 ## Install
 
@@ -26,6 +26,8 @@ pm init my-tool              # new local project (git init + backup config)
 pm save -Message "fix stuff" # commit, push, restic backup of the current project
 pm save --all -NoPush        # commit + back up every project, no push
 pm init --all                # set up every folder not yet configured
+pm restore                   # pick a project from restic snapshot tags and restore it
+pm restore holdclick -DryRun # preview restoring the latest holdclick snapshot
 ```
 
 ## Files

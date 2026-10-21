@@ -107,25 +107,34 @@ function Initialize-ResticRepo([string]$Repository) {
     if ($LASTEXITCODE -ne 0) { throw 'restic init failed.' }
 }
 
+# Numbered pick list. $Line formats an item, $Key is the text a filter matches against.
+# A filter with one match picks it; with several it shows a shorter list.
+function Select-Item([object[]]$Items, [string]$Noun, [scriptblock]$Line, [scriptblock]$Key) {
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        Write-Host ('{0,3}) {1}' -f ($i + 1), (& $Line $Items[$i]))
+    }
+    while ($true) {
+        $answer = Read-Host "Pick a $Noun (1-$($Items.Count), or text to filter, blank to cancel)"
+        if (-not $answer) { return $null }
+        if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $Items.Count) {
+            return $Items[[int]$answer - 1]
+        }
+        $hits = @($Items | Where-Object { (& $Key $_) -like "*$answer*" })
+        if ($hits.Count -eq 1) { return $hits[0] }
+        if ($hits.Count -gt 1) { return Select-Item $hits $Noun $Line $Key }
+        Write-Host "No $Noun matches '$answer'." -ForegroundColor Yellow
+    }
+}
+
 function Select-Repo([object[]]$Repos, [string]$Root) {
-    for ($i = 0; $i -lt $Repos.Count; $i++) {
-        $r = $Repos[$i]
+    $line = {
+        param($r)
         $vis = if ($r.isPrivate) { 'private' } else { 'public ' }
         $here = if (Test-Path (Join-Path $Root "$($r.folder)\.git")) { '*' } else { ' ' }
         $desc = if ($r.description) { " - $($r.description)" } else { '' }
-        Write-Host ('{0,3}) {1} {2}  {3}{4}' -f ($i + 1), $here, $vis, $r.nameWithOwner, $desc)
-    }
-    while ($true) {
-        $answer = Read-Host "Pick a repo (1-$($Repos.Count), or text to filter, blank to cancel)"
-        if (-not $answer) { return $null }
-        if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $Repos.Count) {
-            return $Repos[[int]$answer - 1]
-        }
-        $hits = @($Repos | Where-Object { $_.nameWithOwner -like "*$answer*" })
-        if ($hits.Count -eq 1) { return $hits[0] }
-        if ($hits.Count -gt 1) { return Select-Repo $hits $Root }
-        Write-Host "No repo matches '$answer'." -ForegroundColor Yellow
-    }
+        '{0} {1}  {2}{3}' -f $here, $vis, $r.nameWithOwner, $desc
+    }.GetNewClosure()
+    Select-Item $Repos 'repo' $line { param($r) $r.nameWithOwner }
 }
 
 function Confirm-Action([string]$Prompt) {
@@ -337,10 +346,127 @@ function Invoke-Save([string]$Root, [string]$Name, [string]$Message, [switch]$No
     Invoke-ForEach $projects { param($p) $p.Name } { param($p) Save-ProjectFolder $p.FullName $Message -NoPush:$NoPush }
 }
 
+# Every snapshot in the current RESTIC_REPOSITORY, newest first.
+function Get-Snapshots {
+    $json = restic snapshots --json
+    if ($LASTEXITCODE -ne 0) { throw "restic snapshots failed (exit $LASTEXITCODE)." }
+    @($json | ConvertFrom-Json | Sort-Object { [datetime]$_.time } -Descending)
+}
+
+# One entry per tag: its latest snapshot and how many there are.
+function Get-SnapshotTags([object[]]$Snapshots) {
+    $seen = [ordered]@{}
+    foreach ($s in $Snapshots) {
+        foreach ($t in @($s.tags)) {
+            if (-not $t) { continue }
+            if ($seen.Contains($t)) { $seen[$t].count++ }
+            else { $seen[$t] = [pscustomobject]@{ tag = $t; latest = $s; count = 1 } }
+        }
+    }
+    @($seen.Values)
+}
+
+# The project folder a snapshot was taken of. With an include list there are several
+# paths, so use their common parent.
+function Get-SnapshotRoot([object]$Snapshot) {
+    $paths = @($Snapshot.paths)
+    if ($paths.Count -eq 1) { return $paths[0] }
+    $common = $paths[0] -split '\\'
+    foreach ($p in $paths) {
+        $parts = $p -split '\\'
+        $n = 0
+        while ($n -lt $common.Count -and $n -lt $parts.Count -and $common[$n] -eq $parts[$n]) { $n++ }
+        if ($n -eq 0) { throw "Snapshot $($Snapshot.short_id) has no common folder." }
+        $common = @($common[0..($n - 1)])
+    }
+    $common -join '\'
+}
+
+# D:\projects\x -> /D/projects/x, the form restic uses inside a snapshot.
+function ConvertTo-ResticPath([string]$Path) {
+    '/' + ($Path -replace ':', '' -replace '\\', '/').TrimEnd('/')
+}
+
+# Folder for a tag: a config mapping whose repo name matches, else the tag itself.
+function Get-TagFolder([string]$Tag) {
+    $folders = (Get-PmConfig)['folders']
+    foreach ($key in $folders.Keys) {
+        if (($key -split '/')[-1] -eq $Tag) { return $folders[$key] }
+    }
+    $Tag
+}
+
+function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string]$Target, [switch]$Force, [switch]$DryRun) {
+    Assert-Command restic
+    Assert-ResticPassword
+    if (-not $env:RESTIC_REPOSITORY) { throw 'RESTIC_REPOSITORY is not set.' }
+
+    $snaps = Get-Snapshots
+    if ($Snapshot) {
+        $snap = $snaps | Where-Object { $_.id -like "$Snapshot*" } | Select-Object -First 1
+        if (-not $snap) { throw "No snapshot '$Snapshot' in $env:RESTIC_REPOSITORY." }
+        if (-not $Name) { $Name = @($snap.tags)[0] }
+    }
+    if (-not $Name) {
+        $tags = Get-SnapshotTags $snaps
+        if ($tags.Count -eq 0) { throw "No tagged snapshots in $env:RESTIC_REPOSITORY." }
+        $line = { param($t) '{0,-28} {1:yyyy-MM-dd HH:mm}  {2,3}x  {3}' -f $t.tag, [datetime]$t.latest.time, $t.count, (Get-SnapshotRoot $t.latest) }
+        $pick = Select-Item $tags 'project' $line { param($t) $t.tag }
+        if (-not $pick) { Write-Host 'Cancelled.'; return }
+        $Name = $pick.tag
+    }
+
+    $dest = if ($Target) { $Target } else { Join-Path $Root (Get-TagFolder $Name) }
+    $dest = [IO.Path]::GetFullPath($dest)
+
+    # A project already set up here may back up to a different repository.
+    $configFile = Join-Path $dest $ConfigName
+    if (Test-Path $configFile) {
+        $repository = (Get-Content $configFile -Raw | ConvertFrom-Json).repository
+        if ($repository -and $repository -ne $env:RESTIC_REPOSITORY) {
+            Write-Host "Using $repository from $configFile"
+            $env:RESTIC_REPOSITORY = $repository
+            $snaps = Get-Snapshots
+        }
+    }
+
+    if (-not $Snapshot) {
+        $snap = $snaps | Where-Object { $Name -in @($_.tags) } | Select-Object -First 1
+        if (-not $snap) { throw "No snapshots tagged '$Name' in $env:RESTIC_REPOSITORY." }
+    } elseif ($Name -notin @($snap.tags)) {
+        throw "Snapshot $($snap.short_id) is not tagged '$Name'."
+    }
+
+    $source = Get-SnapshotRoot $snap
+    Write-Step "Restoring $Name from snapshot $($snap.short_id) ($([datetime]$snap.time | Get-Date -Format 'yyyy-MM-dd HH:mm'))"
+    Write-Host "  from $source"
+    Write-Host "  to   $dest"
+
+    if (-not $DryRun -and -not $Force -and (Test-Path $dest) -and (Get-ChildItem $dest -Force | Select-Object -First 1)) {
+        Write-Host "$dest is not empty. Files in the snapshot overwrite files with the same name; other files are left alone." -ForegroundColor Yellow
+        if (-not (Confirm-Action 'Restore into it?')) { Write-Host 'Cancelled.'; return }
+    }
+
+    $resticArgs = @('restore', "$($snap.id):$(ConvertTo-ResticPath $source)", '--target', $dest)
+    if ($DryRun) { $resticArgs += '--dry-run', '-v' }
+    restic @resticArgs
+    if ($LASTEXITCODE -ne 0) { throw "restic restore failed (exit $LASTEXITCODE)." }
+    if ($DryRun) { Write-Host 'Dry run - nothing written.' -ForegroundColor Green; return }
+
+    # .restic is excluded from backups by default; put the default files back.
+    if (Test-Path (Join-Path $dest $ConfigName)) { Initialize-ResticFiles $dest }
+    Write-Host "Restored to $dest" -ForegroundColor Green
+    if (-not (Test-Path (Join-Path $dest '.git'))) {
+        Write-Host 'No .git here: git history is not in restic backups. To reattach it, run in that folder:'
+        Write-Host '  git init; git remote add origin <url>; git fetch; git reset origin/<branch>'
+    }
+}
+
 function Manage-Project {
     <#
     .SYNOPSIS
         pm clone [repo] | pm init [name] | pm save [project]  -- each takes --all.
+        pm restore [project]
     .DESCRIPTION
         clone  Clone a GitHub repo (asks with a list if no name) and set up backups.
                -Folder clones into that folder instead of the repo name and remembers it.
@@ -349,6 +475,9 @@ function Manage-Project {
                Asks for a name if none is given. --all sets up every folder not yet set up.
         save   Commit and push, then back up to OneDrive with restic.
                --all saves every project that is set up.
+        restore  Restore a project's latest restic snapshot (asks with a list of tags if no name).
+               -Snapshot picks another snapshot, -Target another folder, -DryRun previews.
+               Asks before writing into a non-empty folder unless -Force.
         With --all any name is ignored. Everything works under -Root, default the current folder.
     .EXAMPLE
         pm clone flario
@@ -360,11 +489,13 @@ function Manage-Project {
         pm save -Message "fix stuff"
     .EXAMPLE
         pm save --all -NoPush
+    .EXAMPLE
+        pm restore holdclick -DryRun
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, Position = 0)]
-        [ValidateSet('clone', 'init', 'save')]
+        [ValidateSet('clone', 'init', 'save', 'restore')]
         [string]$Action,
 
         [Parameter(Position = 1)]
@@ -374,8 +505,12 @@ function Manage-Project {
         [string]$Owner,
         [string]$Folder,
         [string]$Message,
+        [string]$Snapshot,
+        [string]$Target,
         [switch]$All,
         [switch]$NoPush,
+        [switch]$Force,
+        [switch]$DryRun,
 
         # Catches GNU-style --all, which PowerShell would otherwise treat as a value.
         [Parameter(ValueFromRemainingArguments)]
@@ -385,22 +520,26 @@ function Manage-Project {
 
     if ('--all' -in (@($Name) + @($Rest))) { $All = $true }
     if ($All -and $Folder) { throw '-Folder names a single repo; it cannot be used with --all.' }
+    if ($All -and $Action -eq 'restore') { throw "--all is not valid with 'restore'." }
     if ($All) { $Name = $null }
     elseif ($Rest) { throw "Unexpected argument: $($Rest -join ' ')" }
 
+    $restoreOnly = 'Snapshot', 'Target', 'Force', 'DryRun'
     $bad = switch ($Action) {
-        'clone' { 'Message', 'NoPush' }
-        'init'  { 'Owner', 'Folder', 'Message', 'NoPush' }
-        'save'  { 'Owner', 'Folder' }
+        'clone'   { @('Message', 'NoPush') + $restoreOnly }
+        'init'    { @('Owner', 'Folder', 'Message', 'NoPush') + $restoreOnly }
+        'save'    { @('Owner', 'Folder') + $restoreOnly }
+        'restore' { 'Owner', 'Folder', 'Message', 'NoPush' }
     }
     foreach ($key in $bad) {
         if ($PSBoundParameters.ContainsKey($key)) { throw "-$key is not valid with '$Action'." }
     }
 
     switch ($Action) {
-        'clone' { Invoke-Clone $Root $Name $Folder $Owner -All:$All }
-        'init'  { Invoke-Init $Root $Name -All:$All }
-        'save'  { Invoke-Save $Root $Name $Message -NoPush:$NoPush -All:$All }
+        'clone'   { Invoke-Clone $Root $Name $Folder $Owner -All:$All }
+        'init'    { Invoke-Init $Root $Name -All:$All }
+        'save'    { Invoke-Save $Root $Name $Message -NoPush:$NoPush -All:$All }
+        'restore' { Invoke-Restore $Root $Name $Snapshot $Target -Force:$Force -DryRun:$DryRun }
     }
 }
 
