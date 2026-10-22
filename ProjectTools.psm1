@@ -175,14 +175,26 @@ function Assert-BackupEnvironment([string[]]$Commands) {
     Initialize-ResticRepo $env:RESTIC_REPOSITORY
 }
 
+# GitHub owners pm works with: "owners" in the user config, else you and your organizations.
+function Get-GitHubOwners {
+    $owners = @((Get-PmConfig)['owners'])
+    if ($owners -and $owners[0]) { return $owners }
+    $me = gh api user --jq .login
+    if ($LASTEXITCODE -ne 0) { throw 'gh api user failed. Run gh auth login.' }
+    # Listing organizations needs the read:org scope; without it, just your own repos.
+    $orgs = @(gh api user/orgs --jq '.[].login' 2>$null)
+    @($me) + $orgs
+}
+
 function Get-GitHubRepos([string]$Owner) {
-    Write-Step 'Fetching GitHub repos'
-    $ghArgs = @('repo', 'list')
-    if ($Owner) { $ghArgs += $Owner }
-    $ghArgs += '--no-archived', '--limit', '200', '--json', 'nameWithOwner,name,description,isPrivate,updatedAt'
-    $json = gh @ghArgs
-    if ($LASTEXITCODE -ne 0) { throw 'gh repo list failed.' }
-    $repos = @($json | ConvertFrom-Json | Sort-Object updatedAt -Descending)
+    $owners = if ($Owner) { @($Owner) } else { Get-GitHubOwners }
+    Write-Step "Fetching GitHub repos ($($owners -join ', '))"
+    $repos = foreach ($o in $owners) {
+        $json = gh repo list $o --no-archived --limit 200 --json 'nameWithOwner,name,description,isPrivate,updatedAt'
+        if ($LASTEXITCODE -ne 0) { throw "gh repo list $o failed." }
+        $json | ConvertFrom-Json
+    }
+    $repos = @($repos | Sort-Object updatedAt -Descending)
     if ($repos.Count -eq 0) { throw 'No repos found.' }
     $repos
 }
@@ -415,12 +427,13 @@ function Get-TagFolder([string]$Tag) {
     $Tag
 }
 
-# owner/repo on GitHub for a tag: a config mapping whose repo name matches, else your own repo
-# of that name. $null when there is none or gh is unavailable.
+# owner/repo on GitHub for a tag: a config mapping whose repo name matches, else a repo of
+# that name under each owner pm works with. $null when there is none or gh is unavailable.
 function Find-TagRepo([string]$Tag) {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $null }
     $folders = (Get-PmConfig)['folders']
-    $candidates = @($folders.Keys | Where-Object { ($_ -split '/')[-1] -eq $Tag }) + $Tag
+    $candidates = @($folders.Keys | Where-Object { ($_ -split '/')[-1] -eq $Tag })
+    $candidates += @(Get-GitHubOwners | ForEach-Object { "$_/$Tag" })
     foreach ($c in $candidates) {
         $json = gh repo view $c --json nameWithOwner 2>$null
         if ($LASTEXITCODE -eq 0 -and $json) { return ($json | ConvertFrom-Json).nameWithOwner }

@@ -113,7 +113,7 @@ pm forget  [<project>] [-Snapshot <id>] [-Keep <n>] [-Force] [-DryRun] [--prune]
 
 Clone a GitHub repo into `<root>\<folder>` and set up its backup. The folder is the repo name unless a folder mapping says otherwise (see below).
 
-- **No name:** lists your repos (or `-Owner`'s), newest first.
+- **No name:** lists repos from every owner pm works with (or just `-Owner`'s), newest first. By default that is you and every GitHub organization you belong to (e.g. `keenedge` and `xisle-dev`). To fix the list, set `"owners": ["keenedge", "xisle-dev"]` in `~\.config\pm\config.json`. Listing organizations needs gh's `read:org` scope.
   - Each line shows public/private, the description, and `*` if the repo is already cloned in the root.
   - Enter a number to pick a repo, or text to filter by `owner/name`. A filter with one match picks it; a filter with several shows a shorter list. Leave it blank to cancel.
 - **With a name:** matches `name` or `owner/name` exactly.
@@ -205,7 +205,7 @@ Restore a project's files from restic.
 - **How:** the snapshot's original folder (e.g. `D:\projects\x`) is restored with `<snapshot>:/D/projects/x`, so files land directly in the target rather than under `D\projects\x\...`.
 - **Repository:** if the target already has a `.backup.json`, its `repository` is used; otherwise `RESTIC_REPOSITORY`.
 
-**GitHub first.** If the target has no `.git` and a GitHub repo matches the tag (a `config.json` mapping, else your own repo of that name), `pm` gets git back before restoring:
+**GitHub first.** If the target has no `.git` and a GitHub repo matches the tag (a `config.json` mapping, else a repo of that name under any of those owners, in order), `pm` gets git back before restoring:
 
 - Missing or empty target: clones the repo.
 - Target with files: reattaches it (`git init`, fetch, `git reset` without `--hard`) and checks out only tracked files that are missing. Existing files are not touched.
@@ -265,7 +265,7 @@ pm forget -Snapshot b12f6fd9
 | `<project>\.backup.json` | clone, init | No (`.git/info/exclude`) | restic repository and tag for this project. |
 | `<project>\.restic\include.restic.txt` | clone, init | Yes | Paths to back up. Empty = whole project. |
 | `<project>\.restic\exclude.restic.txt` | clone, init | Yes | Exclude patterns. Default `.restic`, `.git`. |
-| `~\.config\pm\config.json` | clone `-Folder` | — | Folder mappings: `owner/repo` → folder name. |
+| `~\.config\pm\config.json` | clone `-Folder` | — | Folder mappings: `owner/repo` → folder name. Optional `owners` list. |
 | `~\Documents\PowerShell\Modules\ProjectTools\` | Install.ps1 | — | Installed module. |
 | `$PROFILE.CurrentUserAllHosts` | Install.ps1 | — | Gets `Import-Module ProjectTools -DisableNameChecking`. |
 
