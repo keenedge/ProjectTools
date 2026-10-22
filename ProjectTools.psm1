@@ -294,6 +294,11 @@ function Save-ProjectFolder([string]$Dir, [string]$Message, [switch]$NoPush) {
     $top = git -C $dir rev-parse --show-toplevel 2>$null
     $isGit = $LASTEXITCODE -eq 0
     if ($isGit) { $dir = (Resolve-Path $top).Path }
+    # A folder never set up gets the default backup, tagged with its name.
+    if (-not (Test-Path (Join-Path $dir $ConfigName))) {
+        if (-not $env:RESTIC_REPOSITORY) { throw "No $ConfigName in $dir and RESTIC_REPOSITORY is not set." }
+        Set-ProjectBackup $dir (Split-Path $dir -Leaf)
+    }
     $config = Get-ProjectConfig $dir
 
     # 1. Commit and push. Failures here are reported but do not stop the backup.
@@ -350,10 +355,20 @@ function Invoke-Save([string]$Root, [string]$Name, [string]$Message, [switch]$No
     Invoke-ForEach $projects { param($p) $p.Name } { param($p) Save-ProjectFolder $p.FullName $Message -NoPush:$NoPush }
 }
 
+# Throw for a failed restic command, with a clearer message when the repository is locked.
+function Assert-ResticResult([string]$Command) {
+    if ($LASTEXITCODE -eq 0) { return }
+    # restic exit code 11 = failed to lock the repository (0.17+).
+    if ($LASTEXITCODE -eq 11) {
+        throw "The restic repository is locked by another restic process. Wait for it to finish; if none is running, clear a stale lock with 'restic unlock'."
+    }
+    throw "restic $Command failed (exit $LASTEXITCODE)."
+}
+
 # Every snapshot in the current RESTIC_REPOSITORY, newest first.
 function Get-Snapshots {
     $json = restic snapshots --json
-    if ($LASTEXITCODE -ne 0) { throw "restic snapshots failed (exit $LASTEXITCODE)." }
+    Assert-ResticResult snapshots
     @($json | ConvertFrom-Json | Sort-Object { [datetime]$_.time } -Descending)
 }
 
@@ -415,15 +430,37 @@ function Find-TagRepo([string]$Tag) {
 
 # A fresh clone stamps every file with the current time. Set each tracked file's time to its
 # last commit instead, so restore --overwrite if-newer compares against the committed version.
-function Set-CommitTimes([string]$Dir) {
+# With $Only, just those paths.
+function Set-CommitTimes([string]$Dir, [string[]]$Only) {
     $seen = @{}
     $time = $null
     foreach ($line in (git -C $Dir -c core.quotepath=false log --format='@%ct' --name-only --no-renames)) {
         if ($line -match '^@(\d+)$') { $time = [DateTimeOffset]::FromUnixTimeSeconds([long]$Matches[1]).LocalDateTime; continue }
         if (-not $line -or $seen.ContainsKey($line)) { continue }
+        if ($Only -and $line -notin $Only) { continue }
         $seen[$line] = $true
         $path = Join-Path $Dir $line
         if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-Item -LiteralPath $path -Force).LastWriteTime = $time }
+    }
+}
+
+# Turn a folder of files back into a clone without touching the files.
+function Connect-GitRepo([string]$Dir, [string]$Repo) {
+    $branch = gh repo view $Repo --json defaultBranchRef --jq .defaultBranchRef.name
+    if ($LASTEXITCODE -ne 0 -or -not $branch) { throw "Cannot read the default branch of $Repo." }
+    Write-Step "Reattaching $Dir to $Repo ($branch)"
+    git init -q -b $branch $Dir
+    git -C $Dir remote add origin "https://github.com/$Repo.git"
+    git -C $Dir fetch -q origin
+    if ($LASTEXITCODE -ne 0) { throw 'git fetch failed.' }
+    # No --hard: the index follows origin, the files on disk stay as they are.
+    git -C $Dir reset -q "origin/$branch"
+    git -C $Dir branch -q -u "origin/$branch"
+    # Check out only tracked files that are missing on disk.
+    $missing = @(git -C $Dir -c core.quotepath=false ls-files --deleted)
+    if ($missing) {
+        $missing | git -C $Dir checkout --pathspec-from-file=- --
+        Set-CommitTimes $Dir $missing
     }
 }
 
@@ -437,6 +474,7 @@ function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string
         $snap = $snaps | Where-Object { $_.id -like "$Snapshot*" } | Select-Object -First 1
         if (-not $snap) { throw "No snapshot '$Snapshot' in $env:RESTIC_REPOSITORY." }
         if (-not $Name) { $Name = @($snap.tags)[0] }
+        if (-not $Name) { throw "Snapshot $($snap.short_id) has no tag; give a project name too." }
     }
     if (-not $Name) {
         $tags = Get-SnapshotTags $snaps
@@ -463,24 +501,31 @@ function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string
 
     if (-not $Snapshot) {
         $snap = $snaps | Where-Object { $Name -in @($_.tags) } | Select-Object -First 1
-        if (-not $snap) { throw "No snapshots tagged '$Name' in $env:RESTIC_REPOSITORY." }
     } elseif ($Name -notin @($snap.tags)) {
         throw "Snapshot $($snap.short_id) is not tagged '$Name'."
     }
 
-    # No local copy yet: clone the matching GitHub repo first, so restic only adds newer work.
+    # No git here yet: get the tracked files from the matching GitHub repo first, so restic
+    # only adds newer work. A non-empty folder is reattached without touching its files.
     $isEmpty = -not ((Test-Path $dest) -and (Get-ChildItem $dest -Force | Select-Object -First 1))
-    if ($isEmpty) {
-        $repo = Find-TagRepo $Name
-        if ($repo -and $DryRun) {
-            Write-Host "Would clone $repo into $dest first."
-        } elseif ($repo) {
-            Write-Step "Cloning $repo into $dest"
-            gh repo clone $repo $dest
-            if ($LASTEXITCODE -ne 0) { throw 'Clone failed.' }
-            Set-CommitTimes $dest
-            $isEmpty = $false
-        }
+    $repo = if (-not (Test-Path (Join-Path $dest '.git'))) { Find-TagRepo $Name }
+    if (-not $repo -and -not $snap) { throw "No snapshots tagged '$Name' in $env:RESTIC_REPOSITORY and no matching GitHub repo." }
+    if ($repo -and $DryRun) {
+        $how = if ($isEmpty) { 'clone' } else { 'reattach' }
+        Write-Host "Would $how $repo at $dest first."
+    } elseif ($repo -and $isEmpty) {
+        Write-Step "Cloning $repo into $dest"
+        gh repo clone $repo $dest
+        if ($LASTEXITCODE -ne 0) { throw 'Clone failed.' }
+        Set-CommitTimes $dest
+        $isEmpty = $false
+    } elseif ($repo) {
+        Connect-GitRepo $dest $repo
+    }
+
+    if (-not $snap) {
+        Write-Host "No snapshots tagged '$Name' in $env:RESTIC_REPOSITORY - cloned from GitHub only." -ForegroundColor Green
+        return
     }
 
     $source = Get-SnapshotRoot $snap
@@ -494,15 +539,17 @@ function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string
     $resticArgs = @('restore', "$($snap.id):$(ConvertTo-ResticPath $source)", '--target', $dest, '--overwrite', $overwrite)
     if ($DryRun) { $resticArgs += '--dry-run', '-v' }
     restic @resticArgs
-    if ($LASTEXITCODE -ne 0) { throw "restic restore failed (exit $LASTEXITCODE)." }
+    Assert-ResticResult restore
     if ($DryRun) { Write-Host 'Dry run - nothing written.' -ForegroundColor Green; return }
 
-    # .restic is excluded from backups by default; put the default files back.
-    if (Test-Path (Join-Path $dest $ConfigName)) { Initialize-ResticFiles $dest }
+    if (Test-Path (Join-Path $dest $ConfigName)) {
+        # .restic is excluded from backups by default; put the default files back.
+        Initialize-ResticFiles $dest
+        Add-LocalGitExclude $dest $ConfigName
+    }
     Write-Host "Restored to $dest" -ForegroundColor Green
     if (-not (Test-Path (Join-Path $dest '.git'))) {
-        Write-Host 'No .git here: git history is not in restic backups. To reattach it, run in that folder:'
-        Write-Host '  git init; git remote add origin <url>; git fetch; git reset origin/<branch>'
+        Write-Host 'No .git here and no matching GitHub repo: git history is not in restic backups.'
     }
 }
 
@@ -514,8 +561,9 @@ function Invoke-Forget([string]$Name, [string]$Snapshot, [int]$Keep, [switch]$Pr
 
     $snaps = Get-Snapshots
     if ($Snapshot) {
-        $doomed = @($snaps | Where-Object { $_.id -like "$Snapshot*" } | Select-Object -First 1)
-        if (-not $doomed) { throw "No snapshot '$Snapshot' in $env:RESTIC_REPOSITORY." }
+        $doomed = @($snaps | Where-Object { $_.id -like "$Snapshot*" })
+        if ($doomed.Count -eq 0) { throw "No snapshot '$Snapshot' in $env:RESTIC_REPOSITORY." }
+        if ($doomed.Count -gt 1) { throw "'$Snapshot' matches $($doomed.Count) snapshots; give more of the ID." }
         if ($Name -and $Name -notin @($doomed[0].tags)) { throw "Snapshot $($doomed[0].short_id) is not tagged '$Name'." }
     } else {
         if (-not $Name) {
@@ -542,9 +590,7 @@ function Invoke-Forget([string]$Name, [string]$Snapshot, [int]$Keep, [switch]$Pr
     $resticArgs = @('forget') + @($doomed.id)
     if ($Prune) { $resticArgs += '--prune' }
     restic @resticArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "restic forget failed (exit $LASTEXITCODE). If the repository is locked by a finished or crashed run, 'restic unlock' clears stale locks."
-    }
+    Assert-ResticResult forget
     if ($Prune) { Write-Host 'Forgotten and pruned.' -ForegroundColor Green }
     else { Write-Host "Forgotten. Data is freed only after a prune: pm forget ... --prune, or restic prune." -ForegroundColor Green }
 }

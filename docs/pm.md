@@ -168,7 +168,7 @@ pm init --all
 
 Commit, push, and back up one project, or every project with `--all`.
 
-1. **Find the project.** Uses `<root>\<project>`, or the root itself if no project is given, then walks up to the git top level. So running `pm save` anywhere inside a project works. That folder must have a `.backup.json`. A folder that isn't in a git repo skips steps 2 and 3 and is only backed up.
+1. **Find the project.** Uses `<root>\<project>`, or the root itself if no project is given, then walks up to the git top level. So running `pm save` anywhere inside a project works. A folder without `.backup.json` is set up first (tag = folder name, repository = `RESTIC_REPOSITORY`). A folder that isn't in a git repo skips steps 2 and 3 and is only backed up.
 2. **Commit.** Runs `git add -A` (everything, including untracked files that aren't ignored).
    - If there are changes, it shows them and commits with `-Message`. Without `-Message` it asks; blank means `WIP yyyy-MM-dd HH:mm`.
    - A failed commit is a warning; the backup still runs.
@@ -205,7 +205,12 @@ Restore a project's files from restic.
 - **How:** the snapshot's original folder (e.g. `D:\projects\x`) is restored with `<snapshot>:/D/projects/x`, so files land directly in the target rather than under `D\projects\x\...`.
 - **Repository:** if the target already has a `.backup.json`, its `repository` is used; otherwise `RESTIC_REPOSITORY`.
 
-**Clone first.** If the target is missing or empty and a GitHub repo matches the tag (a `config.json` mapping, else your own repo of that name), `pm` clones it before restoring. Each cloned file's time is set to its last commit, so the snapshot only wins where its copy is newer than the committed one.
+**GitHub first.** If the target has no `.git` and a GitHub repo matches the tag (a `config.json` mapping, else your own repo of that name), `pm` gets git back before restoring:
+
+- Missing or empty target: clones the repo.
+- Target with files: reattaches it (`git init`, fetch, `git reset` without `--hard`) and checks out only tracked files that are missing. Existing files are not touched.
+- Files from GitHub get their last commit's time, so the snapshot only wins where its copy is newer.
+- With no snapshots for the tag, the clone alone is the result.
 
 **Safety**
 
@@ -244,7 +249,8 @@ Forget a project's snapshots.
 - **`-Snapshot <id>`:** forgets just that snapshot. With a project too, the snapshot must carry that tag.
 - Lists the snapshots and asks y/N first. `-Force` skips the question; `-DryRun` only lists them.
 - Forgetting only drops the snapshot records. `--prune` (or `-Prune`) also deletes the unused data. Otherwise run `restic prune` later.
-- If restic reports a lock left by a crashed run, `restic unlock` clears it.
+- A `-Snapshot` prefix that matches more than one snapshot is an error.
+- If the repository is locked, `pm` says so; when no other restic is running, `restic unlock` clears a stale lock.
 
 ```powershell
 pm forget holdclick -Keep 5 -DryRun
