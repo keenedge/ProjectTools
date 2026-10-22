@@ -12,7 +12,11 @@ param([string]$Ref = 'main')
 & {
     $ErrorActionPreference = 'Stop'
     $ModuleName = 'ProjectTools'
-    $BaseUrl = "https://raw.githubusercontent.com/keenedge/ProjectTools/$Ref"
+    # raw.githubusercontent.com can serve a branch's files from a stale cache. Resolve the ref
+    # to its commit with the API (not cached that way) and download that exact commit.
+    $sha = Invoke-RestMethod -Uri "https://api.github.com/repos/keenedge/ProjectTools/commits/$Ref" -Headers @{ Accept = 'application/vnd.github.sha' }
+    if ($sha -notmatch '^[0-9a-f]{40}$') { throw "Cannot resolve '$Ref' to a commit." }
+    $BaseUrl = "https://raw.githubusercontent.com/keenedge/ProjectTools/$sha"
     $Files = 'ProjectTools.psm1', 'ProjectTools.psd1'
 
     function Write-Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
@@ -22,7 +26,7 @@ param([string]$Ref = 'main')
     $docs = [Environment]::GetFolderPath('MyDocuments')
     $dest = Join-Path $docs "PowerShell\Modules\$ModuleName"
 
-    Write-Step "Downloading $ModuleName@$Ref"
+    Write-Step "Downloading $ModuleName@$Ref ($($sha.Substring(0, 7)))"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "$ModuleName-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
