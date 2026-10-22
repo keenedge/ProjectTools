@@ -264,37 +264,41 @@ function Invoke-Init([string]$Root, [string]$Name, [switch]$All) {
     Initialize-Folder (Join-Path $Root $Name)
 }
 
-function Save-ProjectFolder([string]$Dir, [string]$Message, [switch]$NoPush) {
-    $dir = (Resolve-Path $Dir).Path
-    $top = git -C $dir rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "$dir is not inside a git repository." }
-    $dir = (Resolve-Path $top).Path
-    $config = Get-ProjectConfig $dir
-
-    # 1. Commit and push. Failures here are reported but do not stop the backup.
-    Write-Step "Committing changes in $dir"
-    git -C $dir add -A
-    git -C $dir diff --cached --quiet
+function Save-GitChanges([string]$Dir, [string]$Message, [switch]$NoPush) {
+    Write-Step "Committing changes in $Dir"
+    git -C $Dir add -A
+    git -C $Dir diff --cached --quiet
     if ($LASTEXITCODE -eq 0) {
         Write-Host 'Nothing to commit.'
     } else {
-        git -C $dir status --short
+        git -C $Dir status --short
         if (-not $Message) { $Message = Read-Host 'Commit message (blank for timestamp)' }
         if (-not $Message) { $Message = "WIP $(Get-Date -Format 'yyyy-MM-dd HH:mm')" }
-        git -C $dir commit -m $Message
+        git -C $Dir commit -m $Message
         if ($LASTEXITCODE -ne 0) { Write-Warning 'Commit failed - continuing with backup.' }
     }
+    if ($NoPush) { return }
 
-    if (-not $NoPush) {
-        git -C $dir rev-parse --abbrev-ref '@{upstream}' *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'No upstream branch - skipping push.'
-        } else {
-            Write-Step 'Pushing'
-            git -C $dir push
-            if ($LASTEXITCODE -ne 0) { Write-Warning 'Push failed (try git pull --rebase) - continuing with backup.' }
-        }
+    git -C $Dir rev-parse --abbrev-ref '@{upstream}' *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'No upstream branch - skipping push.'
+    } else {
+        Write-Step 'Pushing'
+        git -C $Dir push
+        if ($LASTEXITCODE -ne 0) { Write-Warning 'Push failed (try git pull --rebase) - continuing with backup.' }
     }
+}
+
+function Save-ProjectFolder([string]$Dir, [string]$Message, [switch]$NoPush) {
+    $dir = (Resolve-Path $Dir).Path
+    $top = git -C $dir rev-parse --show-toplevel 2>$null
+    $isGit = $LASTEXITCODE -eq 0
+    if ($isGit) { $dir = (Resolve-Path $top).Path }
+    $config = Get-ProjectConfig $dir
+
+    # 1. Commit and push. Failures here are reported but do not stop the backup.
+    if ($isGit) { Save-GitChanges $dir $Message -NoPush:$NoPush }
+    else { Write-Host 'Not a git repository - backup only.' }
 
     # 2. Back up the working folder to OneDrive.
     Write-Step "Backing up to $($config.repository)"
@@ -396,6 +400,33 @@ function Get-TagFolder([string]$Tag) {
     $Tag
 }
 
+# owner/repo on GitHub for a tag: a config mapping whose repo name matches, else your own repo
+# of that name. $null when there is none or gh is unavailable.
+function Find-TagRepo([string]$Tag) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $null }
+    $folders = (Get-PmConfig)['folders']
+    $candidates = @($folders.Keys | Where-Object { ($_ -split '/')[-1] -eq $Tag }) + $Tag
+    foreach ($c in $candidates) {
+        $json = gh repo view $c --json nameWithOwner 2>$null
+        if ($LASTEXITCODE -eq 0 -and $json) { return ($json | ConvertFrom-Json).nameWithOwner }
+    }
+    $null
+}
+
+# A fresh clone stamps every file with the current time. Set each tracked file's time to its
+# last commit instead, so restore --overwrite if-newer compares against the committed version.
+function Set-CommitTimes([string]$Dir) {
+    $seen = @{}
+    $time = $null
+    foreach ($line in (git -C $Dir -c core.quotepath=false log --format='@%ct' --name-only --no-renames)) {
+        if ($line -match '^@(\d+)$') { $time = [DateTimeOffset]::FromUnixTimeSeconds([long]$Matches[1]).LocalDateTime; continue }
+        if (-not $line -or $seen.ContainsKey($line)) { continue }
+        $seen[$line] = $true
+        $path = Join-Path $Dir $line
+        if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-Item -LiteralPath $path -Force).LastWriteTime = $time }
+    }
+}
+
 function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string]$Target, [switch]$Force, [switch]$DryRun) {
     Assert-Command restic
     Assert-ResticPassword
@@ -437,17 +468,30 @@ function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string
         throw "Snapshot $($snap.short_id) is not tagged '$Name'."
     }
 
+    # No local copy yet: clone the matching GitHub repo first, so restic only adds newer work.
+    $isEmpty = -not ((Test-Path $dest) -and (Get-ChildItem $dest -Force | Select-Object -First 1))
+    if ($isEmpty) {
+        $repo = Find-TagRepo $Name
+        if ($repo -and $DryRun) {
+            Write-Host "Would clone $repo into $dest first."
+        } elseif ($repo) {
+            Write-Step "Cloning $repo into $dest"
+            gh repo clone $repo $dest
+            if ($LASTEXITCODE -ne 0) { throw 'Clone failed.' }
+            Set-CommitTimes $dest
+            $isEmpty = $false
+        }
+    }
+
     $source = Get-SnapshotRoot $snap
     Write-Step "Restoring $Name from snapshot $($snap.short_id) ($([datetime]$snap.time | Get-Date -Format 'yyyy-MM-dd HH:mm'))"
     Write-Host "  from $source"
     Write-Host "  to   $dest"
+    # if-newer: a snapshot file replaces a local one only when it is newer. -Force replaces every changed file.
+    $overwrite = if ($Force) { 'always' } else { 'if-newer' }
+    if (-not $isEmpty) { Write-Host "  overwrite: $overwrite" }
 
-    if (-not $DryRun -and -not $Force -and (Test-Path $dest) -and (Get-ChildItem $dest -Force | Select-Object -First 1)) {
-        Write-Host "$dest is not empty. Files in the snapshot overwrite files with the same name; other files are left alone." -ForegroundColor Yellow
-        if (-not (Confirm-Action 'Restore into it?')) { Write-Host 'Cancelled.'; return }
-    }
-
-    $resticArgs = @('restore', "$($snap.id):$(ConvertTo-ResticPath $source)", '--target', $dest)
+    $resticArgs = @('restore', "$($snap.id):$(ConvertTo-ResticPath $source)", '--target', $dest, '--overwrite', $overwrite)
     if ($DryRun) { $resticArgs += '--dry-run', '-v' }
     restic @resticArgs
     if ($LASTEXITCODE -ne 0) { throw "restic restore failed (exit $LASTEXITCODE)." }
@@ -462,22 +506,69 @@ function Invoke-Restore([string]$Root, [string]$Name, [string]$Snapshot, [string
     }
 }
 
+function Invoke-Forget([string]$Name, [string]$Snapshot, [int]$Keep, [switch]$Prune, [switch]$Force, [switch]$DryRun) {
+    Assert-Command restic
+    Assert-ResticPassword
+    if (-not $env:RESTIC_REPOSITORY) { throw 'RESTIC_REPOSITORY is not set.' }
+    if ($Keep -lt 0) { throw '-Keep must be 0 or more.' }
+
+    $snaps = Get-Snapshots
+    if ($Snapshot) {
+        $doomed = @($snaps | Where-Object { $_.id -like "$Snapshot*" } | Select-Object -First 1)
+        if (-not $doomed) { throw "No snapshot '$Snapshot' in $env:RESTIC_REPOSITORY." }
+        if ($Name -and $Name -notin @($doomed[0].tags)) { throw "Snapshot $($doomed[0].short_id) is not tagged '$Name'." }
+    } else {
+        if (-not $Name) {
+            $tags = Get-SnapshotTags $snaps
+            if ($tags.Count -eq 0) { throw "No tagged snapshots in $env:RESTIC_REPOSITORY." }
+            $line = { param($t) '{0,-28} {1:yyyy-MM-dd HH:mm}  {2,3}x  {3}' -f $t.tag, [datetime]$t.latest.time, $t.count, (Get-SnapshotRoot $t.latest) }
+            $pick = Select-Item $tags 'project' $line { param($t) $t.tag }
+            if (-not $pick) { Write-Host 'Cancelled.'; return }
+            $Name = $pick.tag
+        }
+        $tagged = @($snaps | Where-Object { $Name -in @($_.tags) })
+        if ($tagged.Count -eq 0) { throw "No snapshots tagged '$Name' in $env:RESTIC_REPOSITORY." }
+        $doomed = @($tagged | Select-Object -Skip $Keep)
+        if ($doomed.Count -eq 0) { Write-Host "'$Name' has $($tagged.Count) snapshot(s); nothing beyond the newest $Keep."; return }
+    }
+
+    Write-Step "Forgetting $($doomed.Count) snapshot(s) from $env:RESTIC_REPOSITORY"
+    foreach ($s in $doomed) {
+        Write-Host ('  {0}  {1:yyyy-MM-dd HH:mm}  {2}' -f $s.short_id, [datetime]$s.time, (@($s.tags) -join ','))
+    }
+    if ($DryRun) { Write-Host 'Dry run - nothing forgotten.' -ForegroundColor Green; return }
+    if (-not $Force -and -not (Confirm-Action 'Forget these snapshots?')) { Write-Host 'Cancelled.'; return }
+
+    $resticArgs = @('forget') + @($doomed.id)
+    if ($Prune) { $resticArgs += '--prune' }
+    restic @resticArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "restic forget failed (exit $LASTEXITCODE). If the repository is locked by a finished or crashed run, 'restic unlock' clears stale locks."
+    }
+    if ($Prune) { Write-Host 'Forgotten and pruned.' -ForegroundColor Green }
+    else { Write-Host "Forgotten. Data is freed only after a prune: pm forget ... --prune, or restic prune." -ForegroundColor Green }
+}
+
 function Manage-Project {
     <#
     .SYNOPSIS
         pm clone [repo] | pm init [name] | pm save [project]  -- each takes --all.
-        pm restore [project]
+        pm restore [project] | pm forget [project]
     .DESCRIPTION
         clone  Clone a GitHub repo (asks with a list if no name) and set up backups.
                -Folder clones into that folder instead of the repo name and remembers it.
                --all clones every repo you own.
         init   Create a project folder, or adopt an existing one, and set up backups.
                Asks for a name if none is given. --all sets up every folder not yet set up.
-        save   Commit and push, then back up to OneDrive with restic.
-               --all saves every project that is set up.
+        save   Commit and push, then back up to OneDrive with restic. A folder that is not a
+               git repo is only backed up. --all saves every project that is set up.
         restore  Restore a project's latest restic snapshot (asks with a list of tags if no name).
+               An empty or missing folder is first cloned from GitHub when a matching repo exists.
+               Snapshot files replace local ones only when newer; -Force replaces every changed file.
                -Snapshot picks another snapshot, -Target another folder, -DryRun previews.
-               Asks before writing into a non-empty folder unless -Force.
+        forget   Forget a project's snapshots (asks with a list of tags if no name). Asks first
+               unless -Force. -Keep N keeps the newest N, -Snapshot forgets just that one,
+               -DryRun lists them, --prune also frees the space.
         With --all any name is ignored. Everything works under -Root, default the current folder.
     .EXAMPLE
         pm clone flario
@@ -491,11 +582,13 @@ function Manage-Project {
         pm save --all -NoPush
     .EXAMPLE
         pm restore holdclick -DryRun
+    .EXAMPLE
+        pm forget holdclick -Keep 5 --prune
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, Position = 0)]
-        [ValidateSet('clone', 'init', 'save', 'restore')]
+        [ValidateSet('clone', 'init', 'save', 'restore', 'forget')]
         [string]$Action,
 
         [Parameter(Position = 1)]
@@ -507,29 +600,37 @@ function Manage-Project {
         [string]$Message,
         [string]$Snapshot,
         [string]$Target,
+        [int]$Keep,
         [switch]$All,
         [switch]$NoPush,
         [switch]$Force,
         [switch]$DryRun,
+        [switch]$Prune,
 
-        # Catches GNU-style --all, which PowerShell would otherwise treat as a value.
+        # Catches GNU-style --all and --prune, which PowerShell would otherwise treat as values.
         [Parameter(ValueFromRemainingArguments)]
         [string[]]$Rest
     )
     $ErrorActionPreference = 'Stop'
 
-    if ('--all' -in (@($Name) + @($Rest))) { $All = $true }
+    $words = @($Name) + @($Rest)
+    if ('--all' -in $words) { $All = $true }
+    if ('--prune' -in $words) { $Prune = $true; $PSBoundParameters['Prune'] = $true }
+    if ($Name -in '--all', '--prune') { $Name = $null }
+    $Rest = @($Rest | Where-Object { $_ -notin '--all', '--prune' })
     if ($All -and $Folder) { throw '-Folder names a single repo; it cannot be used with --all.' }
-    if ($All -and $Action -eq 'restore') { throw "--all is not valid with 'restore'." }
+    if ($All -and $Action -in 'restore', 'forget') { throw "--all is not valid with '$Action'." }
     if ($All) { $Name = $null }
     elseif ($Rest) { throw "Unexpected argument: $($Rest -join ' ')" }
 
     $restoreOnly = 'Snapshot', 'Target', 'Force', 'DryRun'
+    $forgetOnly = 'Keep', 'Prune'
     $bad = switch ($Action) {
-        'clone'   { @('Message', 'NoPush') + $restoreOnly }
-        'init'    { @('Owner', 'Folder', 'Message', 'NoPush') + $restoreOnly }
-        'save'    { @('Owner', 'Folder') + $restoreOnly }
-        'restore' { 'Owner', 'Folder', 'Message', 'NoPush' }
+        'clone'   { @('Message', 'NoPush') + $restoreOnly + $forgetOnly }
+        'init'    { @('Owner', 'Folder', 'Message', 'NoPush') + $restoreOnly + $forgetOnly }
+        'save'    { @('Owner', 'Folder') + $restoreOnly + $forgetOnly }
+        'restore' { @('Owner', 'Folder', 'Message', 'NoPush') + $forgetOnly }
+        'forget'  { 'Owner', 'Folder', 'Message', 'NoPush', 'Target' }
     }
     foreach ($key in $bad) {
         if ($PSBoundParameters.ContainsKey($key)) { throw "-$key is not valid with '$Action'." }
@@ -540,6 +641,7 @@ function Manage-Project {
         'init'    { Invoke-Init $Root $Name -All:$All }
         'save'    { Invoke-Save $Root $Name $Message -NoPush:$NoPush -All:$All }
         'restore' { Invoke-Restore $Root $Name $Snapshot $Target -Force:$Force -DryRun:$DryRun }
+        'forget'  { Invoke-Forget $Name $Snapshot $Keep -Prune:$Prune -Force:$Force -DryRun:$DryRun }
     }
 }
 

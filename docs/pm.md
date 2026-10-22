@@ -102,6 +102,7 @@ pm clone [<repo>]   [-Root <path>] [-Owner <owner>] [-Folder <folder>] [--all]
 pm init  [<name>]   [-Root <path>]                  [--all]
 pm save  [<project>] [-Root <path>] [-Message <msg>] [-NoPush] [--all]
 pm restore [<project>] [-Root <path>] [-Snapshot <id>] [-Target <path>] [-Force] [-DryRun]
+pm forget  [<project>] [-Snapshot <id>] [-Keep <n>] [-Force] [-DryRun] [--prune]
 ```
 
 - `--all` and `-All` are equivalent. With `--all`, any name you pass is ignored.
@@ -167,7 +168,7 @@ pm init --all
 
 Commit, push, and back up one project, or every project with `--all`.
 
-1. **Find the project.** Uses `<root>\<project>`, or the root itself if no project is given, then walks up to the git top level. So running `pm save` anywhere inside a project works. That folder must have a `.backup.json`.
+1. **Find the project.** Uses `<root>\<project>`, or the root itself if no project is given, then walks up to the git top level. So running `pm save` anywhere inside a project works. That folder must have a `.backup.json`. A folder that isn't in a git repo skips steps 2 and 3 and is only backed up.
 2. **Commit.** Runs `git add -A` (everything, including untracked files that aren't ignored).
    - If there are changes, it shows them and commits with `-Message`. Without `-Message` it asks; blank means `WIP yyyy-MM-dd HH:mm`.
    - A failed commit is a warning; the backup still runs.
@@ -204,17 +205,19 @@ Restore a project's files from restic.
 - **How:** the snapshot's original folder (e.g. `D:\projects\x`) is restored with `<snapshot>:/D/projects/x`, so files land directly in the target rather than under `D\projects\x\...`.
 - **Repository:** if the target already has a `.backup.json`, its `repository` is used; otherwise `RESTIC_REPOSITORY`.
 
+**Clone first.** If the target is missing or empty and a GitHub repo matches the tag (a `config.json` mapping, else your own repo of that name), `pm` clones it before restoring. Each cloned file's time is set to its last commit, so the snapshot only wins where its copy is newer than the committed one.
+
 **Safety**
 
-- If the target exists and isn't empty, `pm` asks first. `-Force` skips the question.
-- Files in the snapshot overwrite files with the same name. Files that aren't in the snapshot are never deleted.
-- `-DryRun` shows what would be restored (`restic restore --dry-run -v`) and writes nothing.
+- Snapshot files replace local files only when the snapshot copy is newer (`--overwrite if-newer`). `-Force` replaces every file that differs.
+- Files that aren't in the snapshot are never deleted.
+- `-DryRun` shows what would be restored (`restic restore --dry-run -v`) and writes nothing; it also says whether it would clone.
 
 **What you get back**
 
-- `.git` and `.restic` are excluded from backups by default, so the restored folder has no git history.
+- `.git` and `.restic` are excluded from backups by default. A cloned project has its git history; otherwise the restored folder has none.
 - If `.backup.json` came back, `pm` recreates the default `.restic` files.
-- To reattach git history, run this in the folder:
+- With no matching GitHub repo, to reattach git history, run this in the folder:
 
   ```powershell
   git init; git remote add origin <url>; git fetch; git reset origin/<branch>
@@ -231,6 +234,23 @@ pm restore holdclick -Snapshot b12f6fd9 -Force
 ```
 
 To browse snapshots directly: `restic snapshots --tag <project>`.
+
+### pm forget
+
+Forget a project's snapshots.
+
+- **No project given:** pick a tag from the same list as `pm restore`.
+- **With a project:** forgets every snapshot with that tag, or all but the newest `-Keep <n>`.
+- **`-Snapshot <id>`:** forgets just that snapshot. With a project too, the snapshot must carry that tag.
+- Lists the snapshots and asks y/N first. `-Force` skips the question; `-DryRun` only lists them.
+- Forgetting only drops the snapshot records. `--prune` (or `-Prune`) also deletes the unused data. Otherwise run `restic prune` later.
+- If restic reports a lock left by a crashed run, `restic unlock` clears it.
+
+```powershell
+pm forget holdclick -Keep 5 -DryRun
+pm forget holdclick -Keep 5 --prune
+pm forget -Snapshot b12f6fd9
+```
 
 ## Files
 
